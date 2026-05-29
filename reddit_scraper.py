@@ -1,37 +1,29 @@
 """
 Reddit complaint scraper — music, software engineering, AI audio, data analytics.
-Outputs: reddit_report.html + reddit_complaints.csv
+No API key required. Uses Reddit's public .json endpoints.
 
-SETUP (one-time, ~2 minutes):
-  1. Log into Reddit → https://www.reddit.com/prefs/apps
-  2. Click "create another app" → choose type: script
-  3. Name it anything, redirect URI: http://localhost:8080
-  4. Copy the client_id (short string under the app name) and client_secret
-  5. Create a file named .env in this directory with:
-       REDDIT_CLIENT_ID=your_client_id_here
-       REDDIT_CLIENT_SECRET=your_client_secret_here
+IMPORTANT: Run this on your personal computer / home internet, NOT a cloud server.
+Reddit blocks data-center IP ranges. Your laptop will work fine.
 
-Then run:  python3 reddit_scraper.py
+Install: pip3 install requests
+Run:     python3 reddit_scraper.py
+
+Outputs: reddit_report.html  (open in browser — searchable/filterable)
+         reddit_complaints.csv
 """
 
-import os
 import csv
-import time
 import html
+import json
+import time
 from datetime import datetime, timezone
-from pathlib import Path
 from collections import Counter
+from pathlib import Path
 
 try:
-    import praw
+    import requests
 except ImportError:
-    raise SystemExit("Missing dependency: pip3 install praw python-dotenv")
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass  # .env vars may already be set in the shell environment
+    raise SystemExit("Missing dependency:  pip3 install requests")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -40,7 +32,7 @@ SUBREDDITS = {
     "SunoAI":              "Music AI / AI Video",
     "udiomusic":           "Music AI / AI Video",
     "aivideo":             "Music AI / AI Video",
-    "StableDiffusion":     "Music AI / AI Video",
+    "AIMusic":             "Music AI / AI Video",
     "MediaSynthesis":      "Music AI / AI Video",
     # Music production
     "WeAreTheMusicMakers": "Music Production",
@@ -74,8 +66,8 @@ COMPLAINT_KEYWORDS = [
     "not working", "help me", "why does", "why is it", "how do i fix",
 ]
 
-POSTS_PER_SUB = 75    # per sort (hot + new)
-MIN_SCORE     = 1
+POSTS_PER_SUB = 50    # per feed (hot + new)
+MIN_UPVOTES   = 1
 
 OUTPUT_HTML = Path("reddit_report.html")
 OUTPUT_CSV  = Path("reddit_complaints.csv")
@@ -87,78 +79,91 @@ CATEGORY_COLORS = {
     "Data / Analytics":       "#047857",
 }
 
-# ── Reddit client ─────────────────────────────────────────────────────────────
+# ── HTTP session ──────────────────────────────────────────────────────────────
 
-def make_reddit() -> praw.Reddit:
-    client_id     = os.getenv("REDDIT_CLIENT_ID", "").strip()
-    client_secret = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
+_session = requests.Session()
+_session.headers.update({
+    "User-Agent": "python:audioaivid-research:v1.0 (personal research script)",
+    "Accept":     "application/json",
+})
 
-    if not client_id or not client_secret:
-        raise SystemExit(
-            "\n[ERROR] Missing Reddit credentials.\n"
-            "Create a .env file with:\n"
-            "  REDDIT_CLIENT_ID=your_id\n"
-            "  REDDIT_CLIENT_SECRET=your_secret\n\n"
-            "Get credentials at: https://www.reddit.com/prefs/apps\n"
-            "Choose type 'script', redirect URI: http://localhost:8080\n"
-        )
 
-    return praw.Reddit(
-        client_id=client_id,
-        client_secret=client_secret,
-        user_agent="AudioAiVid-ComplaintScraper/1.0 (research script)",
-    )
+def fetch_posts(subreddit: str, feed: str = "hot", limit: int = 50) -> list[dict]:
+    url = f"https://www.reddit.com/r/{subreddit}/{feed}.json?limit={limit}&raw_json=1"
+    for attempt in range(3):
+        try:
+            r = _session.get(url, timeout=15)
+            if r.status_code == 429:
+                wait = 10 * (attempt + 1)
+                print(f"\n    [rate-limited] waiting {wait}s...", end="", flush=True)
+                time.sleep(wait)
+                continue
+            if r.status_code == 403:
+                print(f" [private/quarantined — skipped]", end="", flush=True)
+                return []
+            r.raise_for_status()
+            return [c["data"] for c in r.json()["data"]["children"] if c["kind"] == "t3"]
+        except requests.RequestException as e:
+            print(f"\n    [error] {e}", end="", flush=True)
+            time.sleep(3)
+    return []
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Parse ─────────────────────────────────────────────────────────────────────
 
 def complaint_score(text: str) -> int:
     lower = text.lower()
     return sum(1 for kw in COMPLAINT_KEYWORDS if kw in lower)
 
 
-def parse_submission(sub, category: str) -> dict | None:
-    if sub.score < MIN_SCORE or sub.stickied:
+def parse_post(raw: dict, category: str) -> dict | None:
+    if raw.get("score", 0) < MIN_UPVOTES or raw.get("stickied"):
         return None
 
-    selftext = (sub.selftext or "").replace("\n", " ").strip()
-    combined = f"{sub.title} {selftext}"
+    selftext = (raw.get("selftext") or "").replace("\n", " ").strip()
+    if selftext in ("[deleted]", "[removed]"):
+        selftext = ""
+    combined = f"{raw.get('title', '')} {selftext}"
     cscore   = complaint_score(combined)
-    created  = datetime.fromtimestamp(sub.created_utc, tz=timezone.utc).strftime("%Y-%m-%d")
+    created  = datetime.fromtimestamp(raw["created_utc"], tz=timezone.utc).strftime("%Y-%m-%d")
 
     return {
-        "subreddit":       sub.subreddit.display_name,
+        "subreddit":       raw.get("subreddit", ""),
         "category":        category,
-        "title":           sub.title,
-        "score":           sub.score,
-        "num_comments":    sub.num_comments,
+        "title":           raw.get("title", ""),
+        "score":           raw.get("score", 0),
+        "num_comments":    raw.get("num_comments", 0),
         "complaint_score": cscore,
-        "url":             f"https://www.reddit.com{sub.permalink}",
+        "url":             f"https://www.reddit.com{raw.get('permalink', '')}",
         "date":            created,
-        "flair":           sub.link_flair_text or "",
+        "flair":           raw.get("link_flair_text") or "",
         "snippet":         selftext[:300],
     }
 
 # ── Scrape ────────────────────────────────────────────────────────────────────
 
-def scrape(reddit: praw.Reddit) -> list[dict]:
+def scrape() -> list[dict]:
     posts    = []
     seen_ids = set()
 
     for sub_name, category in SUBREDDITS.items():
-        print(f"  r/{sub_name} ...")
-        subreddit = reddit.subreddit(sub_name)
+        print(f"  r/{sub_name} ...", end="", flush=True)
+        count = 0
 
-        for feed in (subreddit.hot(limit=POSTS_PER_SUB), subreddit.new(limit=POSTS_PER_SUB)):
-            try:
-                for submission in feed:
-                    if submission.id in seen_ids:
-                        continue
-                    seen_ids.add(submission.id)
-                    parsed = parse_submission(submission, category)
-                    if parsed:
-                        posts.append(parsed)
-            except Exception as e:
-                print(f"    [WARN] {sub_name}: {e}")
+        for feed in ("hot", "new"):
+            raw_posts = fetch_posts(sub_name, feed=feed, limit=POSTS_PER_SUB)
+            time.sleep(1.5)  # polite delay — public API is rate-limited
+
+            for raw in raw_posts:
+                pid = raw.get("id")
+                if not pid or pid in seen_ids:
+                    continue
+                seen_ids.add(pid)
+                parsed = parse_post(raw, category)
+                if parsed:
+                    posts.append(parsed)
+                    count += 1
+
+        print(f" {count} posts")
 
     posts.sort(key=lambda p: (p["complaint_score"], p["score"]), reverse=True)
     return posts
@@ -320,7 +325,7 @@ footer{{padding:1rem 2rem;color:#334155;font-size:.75rem;border-top:1px solid #1
 </table>
 </div>
 <footer>
-  Reddit public API via PRAW · personal research only ·
+  Reddit public JSON API · no auth required · personal research only ·
   {total:,} posts across {len(SUBREDDITS)} subreddits · {now}
 </footer>
 <script>
@@ -358,9 +363,9 @@ filter();
 # ── Entry ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    reddit = make_reddit()
     print(f"Scraping {len(SUBREDDITS)} subreddits (hot + new, up to {POSTS_PER_SUB} each)...")
-    posts = scrape(reddit)
+    print("No API key needed — using Reddit's public JSON endpoints.\n")
+    posts = scrape()
     print(f"\nCollected {len(posts)} unique posts. Writing outputs...")
     write_csv(posts)
     write_html(posts)
